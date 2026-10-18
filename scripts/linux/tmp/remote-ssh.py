@@ -31,10 +31,11 @@ def sftp_put(local, remote, mode=0o755):
     t.close()
 
 
-def root(cmd, timeout=300):
+def _exec(cmd, timeout=300, as_root=False):
     client = connect()
-    wrapped = "echo admin | su -c %s root" % repr(cmd)
-    stdin, stdout, stderr = client.exec_command(wrapped, timeout=timeout)
+    if as_root:
+        cmd = "echo admin | su -c %s root" % repr(cmd)
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode("utf-8", "replace")
     err = stderr.read().decode("utf-8", "replace")
     code = stdout.channel.recv_exit_status()
@@ -45,18 +46,27 @@ def root(cmd, timeout=300):
     return code
 
 
+def root(cmd, timeout=300):
+    return _exec(cmd, timeout=timeout, as_root=True)
+
+
+def run(cmd, timeout=300):
+    return _exec(cmd, timeout=timeout, as_root=False)
+
+
 if __name__ == "__main__":
     action = sys.argv[1]
     if action == "put":
         sftp_put(sys.argv[2], sys.argv[3])
         print("put", sys.argv[2], "->", sys.argv[3])
-    elif action == "root":
+    elif action in ("root", "run"):
         timeout = 300
         args = sys.argv[2:]
         if args and args[0].startswith("--timeout="):
             timeout = int(args[0].split("=", 1)[1])
             args = args[1:]
-        raise SystemExit(root(" ".join(args), timeout=timeout))
+        fn = root if action == "root" else run
+        raise SystemExit(fn(" ".join(args), timeout=timeout))
     elif action == "build":
         cmd = (
             "nohup bash /tmp/ninfer-build.sh "

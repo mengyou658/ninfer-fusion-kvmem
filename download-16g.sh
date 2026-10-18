@@ -21,20 +21,26 @@ GGUF_FILES=(
   RVN-Q3_K_S-multilingual-mtp.gguf
 )
 
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+# 使用这台机器上已经 login 的 hf，不另装 huggingface_hub，也不切到 root。
+cd /f/comfyui20260902
+# activate 脚本会读未设置的变量，和 set -u 冲突。
+set +u
+# shellcheck disable=SC1091
+source comfyenv/bin/activate
+set -u
+if ! command -v hf >/dev/null 2>&1; then
+  echo "[download-16g] FATAL: hf not found after activating comfyenv" >&2
+  exit 2
+fi
+
+# # 默认走 huggingface.co（本机 hf 已 login）。镜像失败时再取消下一行注释：
+# export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_ENABLE_HF_TRANSFER=0
 
 mkdir -p "$BASE" "$GGUF_DIR"
 
-if command -v hf >/dev/null 2>&1; then
-  hf_download() { hf download "$@"; }
-elif command -v huggingface-cli >/dev/null 2>&1; then
-  hf_download() { huggingface-cli download "$@"; }
-else
-  python3 -m pip install -U 'huggingface_hub>=0.26'
-  hf_download() { python3 -m huggingface_hub.commands.huggingface_cli download "$@"; }
-fi
+hf_download() { hf download "$@"; }
 
 base_missing=()
 for name in "${BASE_FILES[@]}"; do
