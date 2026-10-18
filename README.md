@@ -1,6 +1,6 @@
 # NInfer Fusion KVMem
 
-**面向 Windows / NVIDIA GPU 的长上下文推理实验：用 KVMem 环、主机 KV 存储与按需检索，让设备 KV 池可以小于逻辑上下文，并在后续轮次复用已有上下文。**
+**面向 Windows / Linux + NVIDIA GPU 的长上下文推理实验：用 KVMem 环、主机 KV 存储与按需检索，让设备 KV 池可以小于逻辑上下文，并在后续轮次复用已有上下文。**
 
 本项目基于 NInfer `0.11.0-rtx3090`，发布融合后的源码、复现记录和验证工具。它是 NInfer 的**下游衍生项目**；基座与第三方算法来源见 [署名与改动声明](NOTICE.md)。
 
@@ -41,7 +41,7 @@ KVMem 环保留常驻窗口，将其他页降到主机层；需要时按内容�
 源码可以直接克隆；运行引擎和模型时，使用纯 ASCII 路径，例如 `D:\ninfer\`，避免已记录的中文路径读取问题。
 
 ```powershell
-git clone https://github.com/1314521gjy/ninfer-fusion-kvmem.git
+git clone https://github.com/mengyou658/ninfer-fusion-kvmem.git
 cd ninfer-fusion-kvmem
 ```
 
@@ -183,6 +183,87 @@ cmake --build build-89-clean --target ninfer-serve -j 8
 - **改头文件后确认相关目标确实重编**。仓内 2026-10-07 记录过增量构建漏掉头文件改动的情况；使用新目录可避免拿旧二进制验新代码。
 - **编译不需要模型**；首次 vcpkg 依赖构建需要网络，CUDA 编译需预留内存。完整环境、驱动要求和 FFMPEG 排错见 [编译指南](编译指南-怎么编.md)。
 
+### Linux（原生，不用 vcpkg）
+
+Linux 构建走系统库：CUDA Toolkit、`gcc-13`/`g++-13`、CMake ≥ 3.28、Ninja，以及 FFmpeg / libcurl 开发包（`pkg-config` 能找到即可）。**不要**对 Linux 套用上面的 vcpkg 工具链。已在 **Ubuntu + CUDA 13 + RTX 5060 Ti 16 GB（`sm_120a`）** 上编过并冒烟通过；其他发行版 / 卡型请自行对照。
+
+依赖示例（Debian/Ubuntu）：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential gcc-13 g++-13 cmake ninja-build pkg-config \
+  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+  libswresample-dev libcurl4-openssl-dev python3 python3-numpy
+# CUDA Toolkit：按 NVIDIA 文档安装，保证 `nvcc` 在 PATH（常见：/usr/local/cuda/bin）
+```
+
+配置并编译（默认 `sm_120a` / RTX 50；30 / 40 系分别设 `NINFER_CUDA_ARCH=86` / `89`，且**每个架构用新的空构建目录**）：
+
+```bash
+git clone https://github.com/mengyou658/ninfer-fusion-kvmem.git
+cd ninfer-fusion-kvmem
+
+# RTX 50 → 120a（默认）；RTX 40 → NINFER_CUDA_ARCH=89；RTX 30 → 86
+bash scripts/linux/configure-sm120a.sh
+bash scripts/linux/build-ninfer-serve.sh
+# 产物：src-tree/fusion-engine-src/build-120a/apps/ninfer-serve
+# CUDA 编译建议 -j 8（脚本默认），不要按核数拉满（ptxas 吃内存）
+```
+
+等价手写 CMake（与脚本相同）：
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+export CC=/usr/bin/gcc-13 CXX=/usr/bin/g++-13
+export CUDACXX=/usr/local/cuda/bin/nvcc CUDAHOSTCXX=/usr/bin/g++-13
+
+cd src-tree/fusion-engine-src
+cmake -S . -B build-120a -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+  -DCMAKE_CUDA_ARCHITECTURES=120a \
+  -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=OFF
+cmake --build build-120a --target ninfer-serve -j 8
+```
+
+**运行（16 GB 卡模板）**：仓根 `start-16g-chat.sh`（端口 8091）与 `start-16g-coder.sh`（8092）对应 README 上方的 KVMem 配方（`k8v4`、主机 KV 16 GiB、环环境变量）。引擎默认指向仓库内刚编出的 `build-120a/apps/ninfer-serve`；模型路径用环境变量传入：
+
+```bash
+# 需要一份 NInfer v3 模型；本仓不附带权重
+export ARTIFACT=/path/to/model.v3.ninfer
+# 可选：NINFER_SERVER=/path/to/ninfer-serve  NINFER_PORT=8091
+
+chmod +x start-16g-chat.sh start-16g-coder.sh
+./start-16g-chat.sh
+# 另一终端冒烟：
+curl -s http://127.0.0.1:8091/v1/models
+curl -s http://127.0.0.1:8091/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"ninfer-chat","messages":[{"role":"user","content":"What is 17 + 25? Reply with the number only."}],"max_tokens":64}'
+```
+
+启动日志应出现 `engine ready`、`capacity | KV …`、`reuse host-backed: on`。预期短题答案为 `42`。
+
+**三元 CRACK（PQ2_0）制品**：fusion-kvmem 只吃 NInfer **v3**，且 `t2_g128_fp16` 码表是二补码（0=0, 1=+1, 3=−1）。若手里是 v2 CRACK（PQ2 码 0=−1, 1=0, 2=+1），先升级再原地 remap（**先备份**）：
+
+```bash
+python3 scripts/linux/upgrade-ternary-crack-v2-to-v3.py \
+  /path/to/Bonsai-2-27B-PQ2_0-CRACK.ninfer \
+  /path/to/Bonsai-2-27B-PQ2_0-CRACK.v3.ninfer
+# remap 会改写 code plane；务必先 cp 一份再跑
+cp /path/to/Bonsai-2-27B-PQ2_0-CRACK.v3.ninfer \
+   /path/to/Bonsai-2-27B-PQ2_0-CRACK.v3.ninfer.bak
+python3 scripts/linux/remap-pq2-codes-in-place.py \
+  /path/to/Bonsai-2-27B-PQ2_0-CRACK.v3.ninfer
+export ARTIFACT=/path/to/Bonsai-2-27B-PQ2_0-CRACK.v3.ninfer
+```
+
+`remap-pq2-codes-in-place.py` 的 `entry_start` 必须与 `upgrade_ninfer_v2_to_v3.layout()` 一致（**4096 对齐**）；用错 256 对齐会整体偏 768 B，权重全坏、输出乱码。
+
+显存不足时：先 `NINFER_KV_WINDOW=16384` 或换 chat 脚本；更小卡请用仓根 `start-8g.bat` 的口径自行移植，不要硬套 16G 配方。
+
 ## 已记录的实测结果
 
 以下是维护者记录的特定机器、模型制品和夹具结果，**不是通用 benchmark 或复现保证**。完整日期、日志名和条件见 [实测回执](实测回执与反馈.md)与 [白皮书](复现白皮书-NInfer-KVMem环-20261002.md) §9。
@@ -236,6 +317,8 @@ cmake --build build-89-clean --target ninfer-serve -j 8
 
 ```text
 src-tree/fusion-engine-src/     当前融合引擎源码、内置依赖、测试与上游文档
+scripts/linux/                  Linux 配置/编译与三元 CRACK v2→v3 工具
+start-16g-chat.sh / coder.sh    16 GB 卡 Linux 启动模板（KVMem 配方）
 patches/                       早期改动快照、说明与逐文件对账清单
 docs/                          部署、调优、排错与原始研究记录
 tools/                         模型容器检查、模型体检、冒烟与校验工具
