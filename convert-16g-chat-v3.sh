@@ -37,9 +37,15 @@ if [[ ! -d "$SRC/tools/convert" ]]; then
   exit 2
 fi
 
-PY=python3
-if command -v python3.11 >/dev/null 2>&1; then
+# Prefer activated venv (same as download-16g.sh: source comfyenv/bin/activate).
+if [[ -n "${NINFER_PYTHON:-}" ]]; then
+  PY="$NINFER_PYTHON"
+elif [[ -n "${VIRTUAL_ENV:-}" ]] && command -v python >/dev/null 2>&1; then
+  PY=python
+elif command -v python3.11 >/dev/null 2>&1; then
   PY=python3.11
+else
+  PY=python3
 fi
 
 echo "[convert-16g-chat] src=$SRC"

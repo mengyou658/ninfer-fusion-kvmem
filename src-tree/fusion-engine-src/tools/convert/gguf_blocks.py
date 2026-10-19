@@ -157,9 +157,17 @@ def validate(gguf: GGUFFile) -> None:
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
         stored = info.type_id in GGUF_FORMATS_BY_TYPE
-        if info.shape != shape or (kind == "blocks") != stored or (
-            kind != "blocks" and info.type_name != kind
-        ):
+        if info.shape != shape:
+            raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
+        if kind == "blocks":
+            if not stored:
+                raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
+        elif kind == "BF16":
+            # Official GSQ-RCO packs keep ssm_alpha/beta as BF16. Some community
+            # GGUFs (e.g. RVN IQ3_S / Q3_K) quantise them; text_sources dequants.
+            if info.type_name != "BF16" and not stored:
+                raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
+        elif info.type_name != kind or stored:
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
@@ -297,13 +305,20 @@ def text_sources(
             gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
-            words = untile(gguf.read_bf16_words(g + tensor), 1)
-            direct[n + role] = array_source(
-                torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(
+            full = g + tensor
+            info = gguf.info(full)
+            if info.type_name == "BF16":
+                words = untile(gguf.read_bf16_words(full), 1)
+                values = torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(
                     torch.bfloat16
-                ),
-                g + tensor,
-            )
+                )
+            else:
+                # Community GGUF quantised the GDN a/b projections; recover BF16.
+                dequant = _dequantize(gguf, full, 0, info.shape[0]).detach().cpu().numpy()
+                values = torch.from_numpy(
+                    np.ascontiguousarray(untile(dequant, 1))
+                ).to(torch.bfloat16)
+            direct[n + role] = array_source(values, full)
         ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
         if not np.all(ssm_a < 0):
             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
